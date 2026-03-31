@@ -269,6 +269,83 @@ class Qwen3TTSModel:
     def _build_assistant_text(self, text: str) -> str:
         return f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
 
+    def _normalize_control_tag(self, tag: Optional[str]) -> Optional[str]:
+        if tag is None:
+            return None
+        t = str(tag).strip()
+        if t == "":
+            return None
+        if t.startswith("[") and t.endswith("]"):
+            return t
+        t = t.strip("[]").strip().lower()
+        if t == "":
+            return None
+        return f"[{t}]"
+
+    def _build_control_prefix(self, emotion: Optional[str], intensity: Optional[str]) -> str:
+        tags = []
+        emo_tag = self._normalize_control_tag(emotion)
+        int_tag = self._normalize_control_tag(intensity)
+        if emo_tag is not None:
+            tags.append(emo_tag)
+        if int_tag is not None:
+            tags.append(int_tag)
+        return "".join(tags)
+
+    def _apply_emphasis_text(self, text: str, emphasis: Optional[str]) -> str:
+        if emphasis is None:
+            return text
+        em = str(emphasis).strip()
+        if em == "":
+            return text
+        if "*" in text:
+            return text
+        core = em.strip("*").strip()
+        if core == "":
+            return text
+        if core in text:
+            return text.replace(core, f"*{core}*", 1)
+        return f"{text} *{core}*"
+
+    def _broadcast_optional(self, value: Optional[Union[str, List[Optional[str]]]], n: int) -> List[Optional[str]]:
+        if isinstance(value, list):
+            if len(value) == 1 and n > 1:
+                return value * n
+            if len(value) != n:
+                raise ValueError(f"Batch size mismatch for control field: expected {n}, got {len(value)}")
+            return value
+        return [value] * n
+
+    def _build_controlled_payload_texts(
+        self,
+        texts: List[str],
+        emotion: Optional[Union[str, List[Optional[str]]]] = None,
+        intensity: Optional[Union[str, List[Optional[str]]]] = None,
+        emphasis: Optional[Union[str, List[Optional[str]]]] = None,
+        control_tags: Optional[Union[str, List[Optional[str]]]] = None,
+    ) -> List[str]:
+        n = len(texts)
+        emotions = self._broadcast_optional(emotion, n)
+        intensities = self._broadcast_optional(intensity, n)
+        emphases = self._broadcast_optional(emphasis, n)
+        explicit_tags = self._broadcast_optional(control_tags, n)
+
+        out = []
+        for t, emo, inten, emph, tag in zip(texts, emotions, intensities, emphases, explicit_tags):
+            text_body = self._apply_emphasis_text(t, emph)
+
+            prefix = None
+            if tag is not None and str(tag).strip() != "":
+                prefix = str(tag).strip()
+            else:
+                prefix = self._build_control_prefix(emo, inten)
+
+            if prefix:
+                out.append(f"{prefix} {text_body}".strip())
+            else:
+                out.append(text_body)
+        return out
+
     def _build_ref_text(self, text: str) -> str:
         return f"<|im_start|>assistant\n{text}<|im_end|>\n"
 
@@ -471,6 +548,10 @@ class Qwen3TTSModel:
         self,
         text: Union[str, List[str]],
         language: Union[str, List[str]] = None,
+        emotion: Optional[Union[str, List[str]]] = None,
+        intensity: Optional[Union[str, List[str]]] = None,
+        emphasis: Optional[Union[str, List[str]]] = None,
+        control_tags: Optional[Union[str, List[str]]] = None,
         ref_audio: Optional[Union[AudioLike, List[AudioLike]]] = None,
         ref_text: Optional[Union[str, List[Optional[str]]]] = None,
         x_vector_only_mode: Union[bool, List[bool]] = False,
@@ -585,7 +666,14 @@ class Qwen3TTSModel:
                 voice_clone_prompt_dict = voice_clone_prompt
                 ref_texts_for_ids = None
 
-        input_texts = [self._build_assistant_text(t) for t in texts]
+        payload_texts = self._build_controlled_payload_texts(
+            texts,
+            emotion=emotion,
+            intensity=intensity,
+            emphasis=emphasis,
+            control_tags=control_tags,
+        )
+        input_texts = [self._build_assistant_text(t) for t in payload_texts]
         input_ids = self._tokenize_texts(input_texts)
 
         ref_ids = None
@@ -639,6 +727,10 @@ class Qwen3TTSModel:
         text: Union[str, List[str]],
         instruct: Union[str, List[str]],
         language: Union[str, List[str]] = None,
+        emotion: Optional[Union[str, List[str]]] = None,
+        intensity: Optional[Union[str, List[str]]] = None,
+        emphasis: Optional[Union[str, List[str]]] = None,
+        control_tags: Optional[Union[str, List[str]]] = None,
         non_streaming_mode: bool = True,
         **kwargs,
     ) -> Tuple[List[np.ndarray], int]:
@@ -705,7 +797,14 @@ class Qwen3TTSModel:
 
         self._validate_languages(languages)
 
-        input_ids = self._tokenize_texts([self._build_assistant_text(t) for t in texts])
+        payload_texts = self._build_controlled_payload_texts(
+            texts,
+            emotion=emotion,
+            intensity=intensity,
+            emphasis=emphasis,
+            control_tags=control_tags,
+        )
+        input_ids = self._tokenize_texts([self._build_assistant_text(t) for t in payload_texts])
 
         instruct_ids: List[Optional[torch.Tensor]] = []
         for ins in instructs:
@@ -735,6 +834,10 @@ class Qwen3TTSModel:
         speaker: Union[str, List[str]],
         language: Union[str, List[str]] = None,
         instruct: Optional[Union[str, List[str]]] = None,
+        emotion: Optional[Union[str, List[str]]] = None,
+        intensity: Optional[Union[str, List[str]]] = None,
+        emphasis: Optional[Union[str, List[str]]] = None,
+        control_tags: Optional[Union[str, List[str]]] = None,
         non_streaming_mode: bool = True,
         **kwargs,
     ) -> Tuple[List[np.ndarray], int]:
@@ -815,7 +918,14 @@ class Qwen3TTSModel:
         self._validate_languages(languages)
         self._validate_speakers(speakers)
 
-        input_ids = self._tokenize_texts([self._build_assistant_text(t) for t in texts])
+        payload_texts = self._build_controlled_payload_texts(
+            texts,
+            emotion=emotion,
+            intensity=intensity,
+            emphasis=emphasis,
+            control_tags=control_tags,
+        )
+        input_ids = self._tokenize_texts([self._build_assistant_text(t) for t in payload_texts])
 
         instruct_ids: List[Optional[torch.Tensor]] = []
         for ins in instructs:

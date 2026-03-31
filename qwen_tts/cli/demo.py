@@ -309,12 +309,44 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                         lines=2,
                         placeholder="e.g. Say it in a very angry tone (例如：用特别伤心的语气说).",
                     )
+                    with gr.Row():
+                        emotion_in = gr.Textbox(
+                            label="Emotion (Optional)",
+                            lines=1,
+                            placeholder="e.g. happy / sad / angry / neutral",
+                        )
+                        intensity_in = gr.Dropdown(
+                            label="Intensity (Optional)",
+                            choices=["", "weak", "medium", "strong"],
+                            value="",
+                            interactive=True,
+                        )
+                    with gr.Row():
+                        emphasis_in = gr.Textbox(
+                            label="Emphasis (Optional)",
+                            lines=1,
+                            placeholder="e.g. 特别",
+                        )
+                        control_tags_in = gr.Textbox(
+                            label="Control Tags (Optional, highest priority)",
+                            lines=1,
+                            placeholder="e.g. [happy][strong]",
+                        )
                     btn = gr.Button("Generate (生成)", variant="primary")
                 with gr.Column(scale=3):
                     audio_out = gr.Audio(label="Output Audio (合成结果)", type="numpy")
                     err = gr.Textbox(label="Status (状态)", lines=2)
 
-            def run_instruct(text: str, lang_disp: str, spk_disp: str, instruct: str):
+            def run_instruct(
+                text: str,
+                lang_disp: str,
+                spk_disp: str,
+                instruct: str,
+                emotion: str,
+                intensity: str,
+                emphasis: str,
+                control_tags: str,
+            ):
                 try:
                     if not text or not text.strip():
                         return None, "Text is required (必须填写文本)."
@@ -328,13 +360,21 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                         language=language,
                         speaker=speaker,
                         instruct=(instruct or "").strip() or None,
+                        emotion=(emotion or "").strip() or None,
+                        intensity=(intensity or "").strip() or None,
+                        emphasis=(emphasis or "").strip() or None,
+                        control_tags=(control_tags or "").strip() or None,
                         **kwargs,
                     )
                     return _wav_to_gradio_audio(wavs[0], sr), "Finished. (生成完成)"
                 except Exception as e:
                     return None, f"{type(e).__name__}: {e}"
 
-            btn.click(run_instruct, inputs=[text_in, lang_in, spk_in, instruct_in], outputs=[audio_out, err])
+            btn.click(
+                run_instruct,
+                inputs=[text_in, lang_in, spk_in, instruct_in, emotion_in, intensity_in, emphasis_in, control_tags_in],
+                outputs=[audio_out, err],
+            )
 
         elif model_kind == "voice_design":
             with gr.Row():
