@@ -17,7 +17,7 @@
 import json
 import os
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, List, Optional, Union
 
 import huggingface_hub
 import torch
@@ -50,6 +50,90 @@ from .configuration_qwen3_tts import (Qwen3TTSConfig,
                                       Qwen3TTSTalkerConfig)
 
 logger = logging.get_logger(__name__)
+
+
+class ControlTokenPreprocessor:
+    """Utility to build control-conditioned text payloads.
+
+    Priority rule:
+      control_tags > (emotion + intensity)
+    """
+
+    @staticmethod
+    def _normalize_control_tag(tag: Optional[str]) -> Optional[str]:
+        if tag is None:
+            return None
+        t = str(tag).strip()
+        if t == "":
+            return None
+        if t.startswith("[") and t.endswith("]"):
+            return t
+        t = t.strip("[]").strip().lower()
+        if t == "":
+            return None
+        return f"[{t}]"
+
+    @classmethod
+    def build_control_prefix(cls, emotion: Optional[str], intensity: Optional[str]) -> str:
+        tags = []
+        emo_tag = cls._normalize_control_tag(emotion)
+        int_tag = cls._normalize_control_tag(intensity)
+        if emo_tag is not None:
+            tags.append(emo_tag)
+        if int_tag is not None:
+            tags.append(int_tag)
+        return "".join(tags)
+
+    @staticmethod
+    def apply_emphasis_text(text: str, emphasis: Optional[str]) -> str:
+        if emphasis is None:
+            return text
+        em = str(emphasis).strip()
+        if em == "":
+            return text
+        if "*" in text:
+            return text
+        core = em.strip("*").strip()
+        if core == "":
+            return text
+        if core in text:
+            return text.replace(core, f"*{core}*", 1)
+        return f"{text} *{core}*"
+
+    @staticmethod
+    def _broadcast_optional(value: Optional[Union[str, List[Optional[str]]]], n: int) -> List[Optional[str]]:
+        if isinstance(value, list):
+            if len(value) == 1 and n > 1:
+                return value * n
+            if len(value) != n:
+                raise ValueError(f"Batch size mismatch for control field: expected {n}, got {len(value)}")
+            return value
+        return [value] * n
+
+    @classmethod
+    def build_payload_texts(
+        cls,
+        texts: List[str],
+        emotion: Optional[Union[str, List[Optional[str]]]] = None,
+        intensity: Optional[Union[str, List[Optional[str]]]] = None,
+        emphasis: Optional[Union[str, List[Optional[str]]]] = None,
+        control_tags: Optional[Union[str, List[Optional[str]]]] = None,
+    ) -> List[str]:
+        n = len(texts)
+        emotions = cls._broadcast_optional(emotion, n)
+        intensities = cls._broadcast_optional(intensity, n)
+        emphases = cls._broadcast_optional(emphasis, n)
+        explicit_tags = cls._broadcast_optional(control_tags, n)
+
+        out = []
+        for t, emo, inten, emph, tag in zip(texts, emotions, intensities, emphases, explicit_tags):
+            text_body = cls.apply_emphasis_text(t, emph)
+            if tag is not None and str(tag).strip() != "":
+                prefix = str(tag).strip()
+            else:
+                prefix = cls.build_control_prefix(emo, inten)
+            out.append(f"{prefix} {text_body}".strip() if prefix else text_body)
+        return out
 
 
 def download_weights_from_hf_specific(
@@ -2292,6 +2376,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         return talker_codes_list, talker_hidden_states_list
 
 __all__ = [
+    "ControlTokenPreprocessor",
     "Qwen3TTSForConditionalGeneration",
     "Qwen3TTSTalkerForConditionalGeneration",
     "Qwen3TTSPreTrainedModel",

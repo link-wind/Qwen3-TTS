@@ -14,5 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .configuration_qwen3_tts import Qwen3TTSConfig
-from .modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
+from .modeling_qwen3_tts import (ControlTokenPreprocessor,
+								 Qwen3TTSForConditionalGeneration)
 from .processing_qwen3_tts import Qwen3TTSProcessor
