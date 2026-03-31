@@ -9,6 +9,8 @@ cd Qwen3-TTS/finetuning
 
 Then follow the steps below to complete the entire fine-tuning workflow. Multi-speaker fine-tuning and other advanced fine-tuning features will be supported in future releases.
 
+> Note: this document now includes a **control-conditioned SFT migration spec** (emotion/intensity/emphasis) for ESD + Expresso style training. It defines data contracts and pipeline invariants used by upcoming commits.
+
 ### 1) Input JSONL format
 
 Prepare your training file as a JSONL (one JSON object per line). Each line must contain:
@@ -28,6 +30,30 @@ Example:
 - Keeping `ref_audio` identical across the dataset usually improves speaker consistency and stability during generation.
 
 
+### 1.1) Control-conditioned JSONL schema (ESD + Expresso migration)
+
+For emotion/intensity/emphasis controllable SFT, each JSONL line should additionally include:
+
+- `emotion`: emotion category string, e.g. `happy|sad|angry|neutral|...`
+- `intensity`: discretized level, one of `weak|medium|strong`
+- `emphasis_spans` (optional): emphasis spans as char-level ranges, e.g. `[[2, 4], [10, 12]]`
+- `vad_score` (optional): scalar VAD/arousal score used for debugging
+- `dist_to_neutral` (optional): euclidean distance to neutral centroid used for debugging
+
+Example (control-conditioned):
+```jsonl
+{"audio":"./data/esd_0001.wav","text":"今天真的很开心见到你。","ref_audio":"./data/ref.wav","emotion":"happy","intensity":"strong","emphasis_spans":[[2,4]]}
+{"audio":"./data/expresso_0002.wav","text":"我可以再说一遍。","ref_audio":"./data/ref.wav","emotion":"neutral","intensity":"weak","emphasis_spans":[]}
+```
+
+Compatibility rule:
+- If control fields are missing, pipeline must fall back to the original base SFT behavior.
+
+Control text canonicalization (train/infer must be identical):
+- Canonical prepend form: `[emotion][intensity] + text`
+- Emphasis rendering: preserve `*强调词*` style or convert from `emphasis_spans` into equivalent text markers before tokenization.
+
+
 ### 2) Prepare data (extract `audio_codes`)
 
 Convert `train_raw.jsonl` into a training JSONL that includes `audio_codes`:
@@ -39,6 +65,17 @@ python prepare_data.py \
   --input_jsonl train_raw.jsonl \
   --output_jsonl train_with_codes.jsonl
 ```
+
+For control-conditioned migration data, `prepare_data.py` is expected to additionally:
+
+1. Map source labels from ESD/Expresso/EmotionTalk to unified fields (`emotion`, `emphasis_spans`).
+2. Compute VAD-based `dist_to_neutral`.
+3. Discretize intensity into `weak|medium|strong` with **emotion-specific thresholds**.
+4. Export `audio_codes` while preserving all control fields.
+
+Recommended threshold policy:
+- Primary: emotion-specific thresholds (best alignment with arousal differences across emotions)
+- Fallback: global thresholds for quick smoke tests
 
 
 ### 3) Fine-tune
@@ -62,6 +99,13 @@ Checkpoints will be written to:
 - `output/checkpoint-epoch-2`
 - ...
 
+Control-conditioned SFT invariants:
+
+1. Keep train/infer prompt construction isomorphic (`[emotion][intensity] + text`).
+2. Mask control-token positions in `labels` (set to `-100`) if the objective is codec-token CE only.
+3. Preserve `ref_audio` path and 3-second cloning behavior.
+4. Prefer low LR (`2e-5 ~ 5e-5`) and LLM-only trainable scope to reduce speech-rate drift.
+
 
 ### 4) Quick inference test
 
@@ -84,6 +128,20 @@ wavs, sr = tts.generate_custom_voice(
 )
 sf.write("output.wav", wavs[0], sr)
 ```
+
+Control-conditioned inference target interface (migration spec):
+
+```python
+wavs, sr = tts.generate_custom_voice(
+  text="[happy][strong] 今天*特别*开心。",
+  speaker="speaker_test",
+  # or explicit controls in API params once exposed:
+  # emotion="happy", intensity="strong", emphasis="特别"
+)
+```
+
+Parameter precedence rule (once enabled):
+- `control_tags` > `emotion/intensity` > tags parsed from raw text
 
 ### One-click shell script example
 
@@ -119,3 +177,13 @@ python sft_12hz.py \
   --num_epochs ${EPOCHS} \
   --speaker_name ${SPEAKER_NAME}
 ```
+
+---
+
+## Commit 1 acceptance checklist (docs/schema+pipeline)
+
+- [x] Document control-conditioned JSONL schema (`emotion`, `intensity`, `emphasis_spans`)
+- [x] Define canonical prepend format (`[emotion][intensity] + text`)
+- [x] Define train/infer isomorphism constraints
+- [x] Define compatibility fallback for non-control datasets
+- [x] Define data-prep expectations for VAD distance and intensity discretization
