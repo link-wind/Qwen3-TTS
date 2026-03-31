@@ -88,8 +88,51 @@ class TTSDataset(Dataset):
         return out
 
     
-    def _build_assistant_text(self, text: str) -> str:
-        return f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+    def _apply_emphasis_spans(self, text: str, spans: List[List[int]]) -> str:
+        if not spans:
+            return text
+        if "*" in text:
+            return text
+
+        safe_spans = []
+        text_len = len(text)
+        for span in spans:
+            if not isinstance(span, (list, tuple)) or len(span) != 2:
+                continue
+            s, e = int(span[0]), int(span[1])
+            s = max(0, min(s, text_len))
+            e = max(0, min(e, text_len))
+            if e > s:
+                safe_spans.append((s, e))
+
+        if not safe_spans:
+            return text
+
+        safe_spans.sort(key=lambda x: x[0], reverse=True)
+        out = text
+        for s, e in safe_spans:
+            out = out[:s] + "*" + out[s:e] + "*" + out[e:]
+        return out
+
+    def _build_control_prefix(self, emotion: str = None, intensity: str = None) -> str:
+        tags = []
+        if isinstance(emotion, str) and emotion.strip():
+            tags.append(f"[{emotion.strip().lower()}]")
+        if isinstance(intensity, str) and intensity.strip():
+            tags.append(f"[{intensity.strip().lower()}]")
+        return "".join(tags)
+
+    def _build_assistant_text(
+        self,
+        text: str,
+        emotion: str = None,
+        intensity: str = None,
+        emphasis_spans: List[List[int]] = None,
+    ) -> str:
+        text = self._apply_emphasis_spans(text, emphasis_spans or [])
+        control_prefix = self._build_control_prefix(emotion=emotion, intensity=intensity)
+        payload = f"{control_prefix} {text}".strip() if control_prefix else text
+        return f"<|im_start|>assistant\n{payload}<|im_end|>\n<|im_start|>assistant\n"
     
     def _ensure_list(self, x: MaybeList) -> List[Any]:
         return x if isinstance(x, list) else [x]
@@ -123,10 +166,18 @@ class TTSDataset(Dataset):
         audio_path  = item["audio"]
         text        = item["text"]
         audio_codes = item["audio_codes"]
+        emotion     = item.get("emotion", None)
+        intensity   = item.get("intensity", None)
+        emphasis_spans = item.get("emphasis_spans", [])
         language        = item.get('language','Auto')
         ref_audio_path  = item['ref_audio']
 
-        text = self._build_assistant_text(text)
+        text = self._build_assistant_text(
+            text,
+            emotion=emotion,
+            intensity=intensity,
+            emphasis_spans=emphasis_spans,
+        )
         text_ids = self._tokenize_texts(text)
 
         audio_codes = torch.tensor(audio_codes, dtype=torch.long)
@@ -140,7 +191,7 @@ class TTSDataset(Dataset):
         return {
             "text_ids": text_ids[:,:-5],    # 1 , t
             "audio_codes":audio_codes,      # t, 16
-            "ref_mel":ref_mel
+            "ref_mel":ref_mel,
         }
         
     def collate_fn(self, batch):
