@@ -31,18 +31,19 @@ AudioLike = Union[
 MaybeList = Union[Any, List[Any]]
 
 class TTSDataset(Dataset):
-    def __init__(self, data_list, processor, config:Qwen3TTSConfig, lag_num = -1):
+    def __init__(self, data_list, processor, config:Qwen3TTSConfig, lag_num = -1, control_mode: str = "prompt"):
         self.data_list = data_list
         self.processor = processor
         self.lag_num = lag_num
         self.config = config
+        self.control_mode = control_mode
 
     def __len__(self):
         return len(self.data_list)
     
     def _load_audio_to_np(self, x: str) -> Tuple[np.ndarray, int]:
         
-        audio, sr = librosa.load(x, sr=None, mono=True)
+        audio, sr = librosa.load(x, sr=24000, mono=True)
 
         if audio.ndim > 1:
             audio = np.mean(audio, axis=-1)
@@ -122,17 +123,61 @@ class TTSDataset(Dataset):
             tags.append(f"[{intensity.strip().lower()}]")
         return "".join(tags)
 
+    def _build_natural_language_instruct(self, emotion: str = None, intensity: str = None, emphasis: str = None) -> str:
+        emotion_map = {
+            "happy": "开心",
+            "sad": "难过",
+            "angry": "生气",
+            "surprised": "惊喜",
+            "neutral": "中性",
+        }
+        intensity_map = {
+            "weak": "轻微",
+            "medium": "中等",
+            "strong": "强烈",
+        }
+
+        emo = emotion_map.get(str(emotion).strip().lower(), str(emotion).strip()) if emotion else ""
+        inten = intensity_map.get(str(intensity).strip().lower(), str(intensity).strip()) if intensity else ""
+
+        parts = []
+        if emo and inten:
+            parts.append(f"请用{emo}、{inten}的语气说下面这句话")
+        elif emo:
+            parts.append(f"请用{emo}的语气说下面这句话")
+        elif inten:
+            parts.append(f"请用{inten}强度的语气说下面这句话")
+
+        if emphasis and str(emphasis).strip():
+            parts.append(f"并强调“{str(emphasis).strip()}”")
+
+        if not parts:
+            return ""
+
+        return "，".join(parts) + "。"
+
+    def _build_dialog_text(self, text: str) -> str:
+        # IMPORTANT:
+        # Keep the supervised assistant text clean; instruct is passed via a separate conditioning path.
+        return f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+
     def _build_assistant_text(
         self,
         text: str,
         emotion: str = None,
         intensity: str = None,
         emphasis_spans: List[List[int]] = None,
+        instruct: str = None,
+        emphasis: str = None,
     ) -> str:
         text = self._apply_emphasis_spans(text, emphasis_spans or [])
+        if self.control_mode == "instruct":
+            nl_instruct = instruct or self._build_natural_language_instruct(emotion=emotion, intensity=intensity, emphasis=emphasis)
+            return self._build_dialog_text(text=text), nl_instruct
+
         control_prefix = self._build_control_prefix(emotion=emotion, intensity=intensity)
         payload = f"{control_prefix} {text}".strip() if control_prefix else text
-        return f"<|im_start|>assistant\n{payload}<|im_end|>\n<|im_start|>assistant\n"
+        return f"<|im_start|>assistant\n{payload}<|im_end|>\n<|im_start|>assistant\n", ""
     
     def _ensure_list(self, x: MaybeList) -> List[Any]:
         return x if isinstance(x, list) else [x]
@@ -169,14 +214,18 @@ class TTSDataset(Dataset):
         emotion     = item.get("emotion", None)
         intensity   = item.get("intensity", None)
         emphasis_spans = item.get("emphasis_spans", [])
+        emphasis = item.get("emphasis", None)
+        instruct = item.get("instruct", None)
         language        = item.get('language','Auto')
         ref_audio_path  = item['ref_audio']
 
-        text = self._build_assistant_text(
+        text, instruct_text = self._build_assistant_text(
             text,
             emotion=emotion,
             intensity=intensity,
             emphasis_spans=emphasis_spans,
+            instruct=instruct,
+            emphasis=emphasis,
         )
         text_ids = self._tokenize_texts(text)
 
@@ -192,6 +241,7 @@ class TTSDataset(Dataset):
             "text_ids": text_ids[:,:-5],    # 1 , t
             "audio_codes":audio_codes,      # t, 16
             "ref_mel":ref_mel,
+            "instruct_text": instruct_text,
         }
         
     def collate_fn(self, batch):
@@ -265,5 +315,6 @@ class TTSDataset(Dataset):
             'codec_embedding_mask':codec_embedding_mask.unsqueeze(-1),
             'codec_0_labels':codec_0_labels,
             'codec_ids': codec_ids,
-            'codec_mask':codec_mask
+            'codec_mask':codec_mask,
+            'instruct_texts':[data.get('instruct_text', '') for data in batch],
         }

@@ -22,3 +22,9 @@ wheels/
 .vscode/
 venv/
 env/
+*data/
+*output_esd/
+*output_esd_instruct/
+*ab_instruct_validate/
+*ab_instruct_validate_run1/
+*models/

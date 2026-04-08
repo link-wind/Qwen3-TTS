@@ -10,36 +10,6 @@ import numpy as np
 from grpo_rollout import RolloutItem
 
 
-def _clipped_match(x: float, target: float, tol: float) -> float:
-    if tol <= 0:
-        return 0.0
-    return float(np.clip(1.0 - abs(float(x) - float(target)) / float(tol), 0.0, 1.0))
-
-
-def _emotion_acoustic_proxy(item: RolloutItem) -> float:
-    """Fallback emotion consistency proxy from waveform stats.
-
-    This is intentionally simple and bounded in [0, 1], used only when no
-    classifier/meta label is available.
-    """
-    emo = (item.prompt.emotion or "").lower().strip()
-    rms = float(item.aux.get("rms", 0.0))
-    peak = float(item.aux.get("peak", 0.0))
-
-    # rough target anchors in normalized waveform space
-    targets = {
-        "neutral": (0.04, 0.22),
-        "happy": (0.08, 0.32),
-        "sad": (0.03, 0.18),
-        "angry": (0.12, 0.45),
-        "surprised": (0.10, 0.40),
-    }
-    trms, tpeak = targets.get(emo, (0.07, 0.30))
-    s_rms = _clipped_match(rms, trms, tol=max(trms, 1e-4))
-    s_peak = _clipped_match(peak, tpeak, tol=max(tpeak, 1e-4))
-    return float(0.7 * s_rms + 0.3 * s_peak)
-
-
 @dataclass
 class RewardWeights:
     ser: float = 1.0
@@ -56,8 +26,7 @@ def reward_ser_accuracy(item: RolloutItem) -> float:
     meta = item.prompt.meta or {}
     if "ser_correct" in meta:
         return float(meta["ser_correct"])
-    # fallback: emotion-consistency proxy
-    return _emotion_acoustic_proxy(item)
+    return 0.0
 
 
 def reward_emotion_intensity_fidelity(item: RolloutItem) -> float:

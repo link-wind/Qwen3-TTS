@@ -22,6 +22,7 @@ from typing import List
 import torch
 from accelerate import Accelerator
 from dataset import TTSDataset
+from huggingface_hub import snapshot_download
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from safetensors.torch import save_file
 from torch.optim import AdamW
@@ -83,6 +84,58 @@ def _print_trainable_stats(model, accelerator: Accelerator):
     )
 
 
+def _resolve_model_path(model_path: str) -> str:
+    if os.path.isdir(model_path):
+        return model_path
+    return snapshot_download(model_path, allow_patterns=["*"], local_files_only=False)
+
+
+def _build_instruct_prefix_embeds(processor, model, instruct_texts):
+    if instruct_texts is None:
+        return None, None
+
+    wrapped = []
+    non_empty = False
+    for txt in instruct_texts:
+        t = (txt or "").strip()
+        if t:
+            non_empty = True
+            wrapped.append(f"<|im_start|>user\n{t}<|im_end|>\n")
+        else:
+            wrapped.append("")
+
+    if not non_empty:
+        return None, None
+
+    emb_list = []
+    len_list = []
+    for text in wrapped:
+        if text == "":
+            emb = torch.zeros((0, model.talker.config.hidden_size), device=model.device, dtype=model.dtype)
+        else:
+            tok = processor(text=text, return_tensors="pt", padding=True)
+            ids = tok["input_ids"].to(model.device)
+            txt_emb = model.talker.get_text_embeddings()(ids)
+            emb = model.talker.text_projection(txt_emb).squeeze(0)
+        emb_list.append(emb)
+        len_list.append(emb.shape[0])
+
+    max_len = max(len_list)
+    if max_len == 0:
+        return None, None
+
+    bsz = len(emb_list)
+    hidden = model.talker.config.hidden_size
+    prefix = torch.zeros((bsz, max_len, hidden), device=model.device, dtype=model.dtype)
+    prefix_mask = torch.zeros((bsz, max_len), device=model.device, dtype=torch.long)
+    for i, emb in enumerate(emb_list):
+        if emb.shape[0] > 0:
+            prefix[i, :emb.shape[0], :] = emb
+            prefix_mask[i, :emb.shape[0]] = 1
+
+    return prefix, prefix_mask
+
+
 def train():
     global target_speaker_embedding
 
@@ -91,9 +144,16 @@ def train():
     parser.add_argument("--output_model_path", type=str, default="output")
     parser.add_argument("--train_jsonl", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--lr", type=float, default=5e-6)
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
+    parser.add_argument(
+        "--control_mode",
+        type=str,
+        default="instruct",
+        choices=["prompt", "instruct"],
+        help="Control interface mode in dataset text construction.",
+    )
     parser.add_argument(
         "--freeze_codec_embedding",
         action="store_true",
@@ -110,7 +170,7 @@ def train():
 
     accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
 
-    MODEL_PATH = args.init_model_path
+    MODEL_PATH = _resolve_model_path(args.init_model_path)
 
     qwen3tts = Qwen3TTSModel.from_pretrained(
         MODEL_PATH,
@@ -121,7 +181,7 @@ def train():
 
     train_data = open(args.train_jsonl).readlines()
     train_data = [json.loads(line) for line in train_data]
-    dataset = TTSDataset(train_data, qwen3tts.processor, config)
+    dataset = TTSDataset(train_data, qwen3tts.processor, config, control_mode=args.control_mode)
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
 
     _configure_trainable_scope(
@@ -154,6 +214,7 @@ def train():
                 attention_mask = batch['attention_mask']
                 codec_0_labels = batch['codec_0_labels']
                 codec_mask = batch['codec_mask']
+                instruct_texts = batch.get('instruct_texts', None)
 
                 speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach()
                 if target_speaker_embedding is None:
@@ -172,6 +233,40 @@ def train():
                     codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
                     codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
                     input_embeddings = input_embeddings + codec_i_embedding
+
+                instruct_prefix_embeds, instruct_prefix_mask = _build_instruct_prefix_embeds(
+                    processor=qwen3tts.processor,
+                    model=model,
+                    instruct_texts=instruct_texts,
+                )
+
+                if instruct_prefix_embeds is not None:
+                    input_embeddings = torch.cat([instruct_prefix_embeds, input_embeddings], dim=1)
+                    attention_mask = torch.cat([instruct_prefix_mask, attention_mask], dim=1)
+
+                    bsz = codec_0_labels.shape[0]
+                    prefix_len = instruct_prefix_embeds.shape[1]
+                    prefix_labels = torch.full(
+                        (bsz, prefix_len),
+                        -100,
+                        dtype=codec_0_labels.dtype,
+                        device=codec_0_labels.device,
+                    )
+                    codec_0_labels = torch.cat([prefix_labels, codec_0_labels], dim=1)
+
+                    prefix_codec_mask = torch.zeros(
+                        (codec_mask.shape[0], prefix_len),
+                        dtype=codec_mask.dtype,
+                        device=codec_mask.device,
+                    )
+                    codec_mask = torch.cat([prefix_codec_mask, codec_mask], dim=1)
+
+                    prefix_codec_ids = torch.zeros(
+                        (codec_ids.shape[0], prefix_len, codec_ids.shape[2]),
+                        dtype=codec_ids.dtype,
+                        device=codec_ids.device,
+                    )
+                    codec_ids = torch.cat([prefix_codec_ids, codec_ids], dim=1)
 
                 outputs = model.talker(
                     inputs_embeds=input_embeddings[:, :-1, :],
